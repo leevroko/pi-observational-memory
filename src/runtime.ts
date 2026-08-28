@@ -102,6 +102,8 @@ export class Runtime {
 	consolidationInFlight = false;
 	consolidationPromise: Promise<void> | null = null;
 	consolidationPhase: ConsolidationPhase | undefined;
+	/** Set while a consolidation run should stop quietly (session replaced/reloaded mid-flight). */
+	consolidationCancelled = false;
 	compactInFlight = false;
 	compactHookInFlight = false;
 	resolveFailureNotified = false;
@@ -280,8 +282,16 @@ export class Runtime {
 		return recovered;
 	}
 
+	/** Cancel the in-flight consolidation run: session_shutdown emitted mid-flight means
+	 * captured pi/ctx objects are about to go stale, so the run must stop before it
+	 * touches them (docs/extensions.md — session replacement lifecycle). */
+	cancelConsolidation(): void {
+		this.consolidationCancelled = true;
+	}
+
 	launchConsolidationTask(ctx: LaunchCtx, work: () => Promise<void>): Promise<void> {
 		this.consolidationInFlight = true;
+		this.consolidationCancelled = false;
 		this.consolidationPhase = undefined;
 		this.lastObserverError = undefined;
 		this.lastReflectorError = undefined;

@@ -141,6 +141,14 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 	};
 	pi.on("agent_start", launch);
 	pi.on("turn_end", launch);
+	// A session replacement or reload emits session_shutdown on the (still-active)
+	// old runtime before tearing it down. Stop the in-flight pipeline there — the
+	// captured pi/ctx it holds goes stale right after (docs/extensions.md,
+	// "Session replacement lifecycle and footguns"), and using it would reject the
+	// remaining stages with the stale-ctx error instead of cancelling them cleanly.
+	pi.on("session_shutdown", () => {
+		runtime.cancelConsolidation();
+	});
 }
 
 function debugSessionMetadata(ctx: ConsolidationCtx): { sessionId?: string; sessionFile?: string } {
@@ -190,12 +198,18 @@ export async function runConsolidationPipeline(
 	ctx: ConsolidationCtx,
 ): Promise<void> {
 	const resolveModel = makeModelResolver(runtime, ctx);
+	const cancelled = () => runtime.consolidationCancelled === true;
 
 	runtime.consolidationPhase = "observer";
 	try {
 		const observerOutcome = await runObserverStage(pi, runtime, ctx, resolveModel);
+		if (cancelled()) {
+			debugLog("consolidation.cancelled", { after: "observer" });
+			return;
+		}
 		if (observerOutcome === "abort") return;
 	} catch (error) {
+		if (cancelled()) return; // stale ctx — no warning spam after session replacement
 		debugLog("observer.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "observer", error) });
 		return;
 	}
@@ -204,8 +218,13 @@ export async function runConsolidationPipeline(
 	let reflectorResult: ReflectorStageResult;
 	try {
 		reflectorResult = await runReflectorStage(pi, runtime, ctx, resolveModel);
+		if (cancelled()) {
+			debugLog("consolidation.cancelled", { after: "reflector" });
+			return;
+		}
 		if (reflectorResult.outcome === "abort") return;
 	} catch (error) {
+		if (cancelled()) return;
 		debugLog("reflector.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflector", error) });
 		return;
 	}
@@ -213,7 +232,9 @@ export async function runConsolidationPipeline(
 	runtime.consolidationPhase = "dropper";
 	try {
 		await runDropperStage(pi, runtime, ctx, resolveModel, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
+		if (cancelled()) debugLog("consolidation.cancelled", { after: "dropper" });
 	} catch (error) {
+		if (cancelled()) return;
 		debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
 	}
 }
@@ -256,6 +277,7 @@ async function runObserverStage(
 	// derives from the resolved model's context window.
 	const resolved = await resolveModel("observer");
 	if (!resolved) return "abort";
+	if (runtime.consolidationCancelled) return "abort"; // session replaced while resolving — drop out before touching captured ctx
 
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 	const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
@@ -328,6 +350,7 @@ async function runObserverStage(
 		}
 		throw error;
 	}
+	if (runtime.consolidationCancelled) return "abort"; // cancel before appending with a possibly-stale pi
 	if (!observations || observations.length === 0) {
 		// Deliberate empty: routine info, not a warning, and back off re-fires
 		// over the same span (#23).
@@ -378,6 +401,7 @@ async function runReflectorStage(
 	);
 	const resolved = await resolveModel("reflector");
 	if (!resolved) return { outcome: "abort", sameRunReflections: [] };
+	if (runtime.consolidationCancelled) return { outcome: "abort", sameRunReflections: [] };
 
 	const folded = foldLedger(entries);
 	const reflections = await runReflector({
@@ -391,6 +415,7 @@ async function runReflectorStage(
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
 	});
 	if (!reflections) return { outcome: "continue", sameRunReflections: [] };
+	if (runtime.consolidationCancelled) return { outcome: "abort", sameRunReflections: [] }; // cancel before appending
 
 	const data = buildReflectionsRecordedData(reflections, observationCoverageId);
 	if (!data) return { outcome: "continue", sameRunReflections: [] };
@@ -451,6 +476,7 @@ async function runDropperStage(
 	);
 	const resolved = await resolveModel("dropper");
 	if (!resolved) return "abort";
+	if (runtime.consolidationCancelled) return "abort"; // session replaced while resolving
 
 	const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
 	const droppedIds = await runDropper({
@@ -464,6 +490,7 @@ async function runDropperStage(
 		maxTurns: runtime.config.agentMaxTurns,
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
 	});
+	if (runtime.consolidationCancelled) return "abort"; // cancel before appending with a possibly-stale pi
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
 	debugLog("dropper.append", {

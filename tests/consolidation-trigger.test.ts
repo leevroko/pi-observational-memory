@@ -760,4 +760,47 @@ describe("observer chunk cap", () => {
 		expect(mockAgents.runObserver).toHaveBeenCalledWith(expect.objectContaining({ allowedSourceEntryIds: ["raw-1"] }));
 		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.objectContaining({ coversUpToId: "raw-1" }));
 	});
+
+	it("cancels cleanly when session_shutdown fires before the pipeline runs", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, pi, runtime, ctx } = setup({ entries });
+		runtime.cancelConsolidation = () => {
+			(runtime as any).consolidationCancelled = true;
+		};
+
+		// Session replaced (or reloaded) between launch and execution: the captured
+		// pi/ctx are about to go stale, so the run must stop without touching them.
+		fire("session_shutdown");
+		fire();
+		await runLaunchedWork();
+
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(ctx.ui.notify).not.toHaveBeenCalled();
+	});
+
+	it("cancels mid-flight without stale-ctx failures or further appends", async () => {
+		const obs = observation("cccccccccccc", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
+		const ref = reflection("eeeeeeeeeeee", ["cccccccccccc"]);
+		mockAgents.runObserver.mockResolvedValueOnce([obs]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, pi, runtime, ctx } = setup({ entries });
+		runtime.cancelConsolidation = () => {
+			(runtime as any).consolidationCancelled = true;
+		};
+		mockAgents.runReflector.mockImplementationOnce(async () => {
+			// Session replaced while the reflector agent runs.
+			fire("session_shutdown");
+			return [ref];
+		});
+
+		fire();
+		await runLaunchedWork();
+
+		// Observer entry lands while the session is still alive; nothing after it does.
+		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, expect.anything());
+		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+		const warnings = ctx.ui.notify.mock.calls.filter((call) => call[1] === "warning");
+		expect(warnings).toHaveLength(0);
+	});
 });
