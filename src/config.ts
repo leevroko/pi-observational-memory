@@ -39,12 +39,35 @@ export interface Config {
 	 * window; see {@link resolveObserverChunkMaxTokens}.
 	 */
 	observerChunkMaxTokens?: number;
+	/**
+	 * Hard cap (estimated tokens) on the rendered compaction summary. Unset
+	 * (default) derives the cap from the session model's context window; see
+	 * {@link resolveSummaryMaxTokens}. The cap is the deterministic guard against
+	 * a summary that alone exceeds the context budget and re-triggers compaction
+	 * in a loop.
+	 */
+	summaryMaxTokens?: number;
 	compactAfterTokens: number;
 	compactAfterTokensMode: CompactAfterTokensMode;
 	compactAfterTokensRatio: number;
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
+	/** Hard ceiling for the active reflection pool; crossing it arms the reflection dropper. */
+	reflectionsPoolMaxTokens: number;
+	/** Pool size the reflection dropper trims toward once the hard ceiling is crossed. */
+	reflectionsPoolTargetTokens: number;
 	agentMaxTurns: number;
+	/**
+	 * Ordered chain of models the memory workers may use. The head is preferred;
+	 * the next entry takes over when an earlier one cannot be resolved (unknown
+	 * provider or model id, no credential) or fails while a call is in flight.
+	 */
+	models?: ConfiguredModel[];
+	/**
+	 * Legacy single-model form, kept so existing V3 configs keep working.
+	 * modelChain reads it as the tail of the chain, so a config that sets only
+	 * model behaves exactly like models: [model].
+	 */
 	model?: ConfiguredModel;
 	showWorkerNotifications: boolean;
 	passive: boolean;
@@ -59,6 +82,8 @@ export const DEFAULTS: Config = {
 	compactAfterTokensRatio: 0.68,
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
+	reflectionsPoolMaxTokens: 24_000,
+	reflectionsPoolTargetTokens: 12_000,
 	agentMaxTurns: 16,
 	showWorkerNotifications: true,
 	passive: false,
@@ -128,6 +153,39 @@ export function resolveObserverChunkMaxTokens(config: Config, contextWindow: num
 	return OBSERVER_CHUNK_FALLBACK_MAX_TOKENS;
 }
 
+/**
+ * Fraction of the session model's context window the rendered compaction summary
+ * may occupy. The summary is injected into every subsequent context, so it must
+ * leave the bulk of the window for actual work; 0.15 keeps a 128K window's memory
+ * at ~19K tokens and a 200K window's at ~30K.
+ */
+export const SUMMARY_CONTEXT_RATIO = 0.15;
+
+/** Summary cap used when no config is set and the context window is unknown. */
+export const SUMMARY_FALLBACK_MAX_TOKENS = 24_000;
+
+/**
+ * Resolve the hard cap (estimated tokens) on the rendered compaction summary.
+
+ * An explicit `summaryMaxTokens` config value always wins. Otherwise the cap is
+ * `floor(contextWindow * SUMMARY_CONTEXT_RATIO)`, falling back to
+ * {@link SUMMARY_FALLBACK_MAX_TOKENS} when the context window is unavailable.
+
+ * Without this cap a memory pool that outgrows the model's context budget
+ * renders a summary that alone exceeds the window, so every compaction
+ * immediately re-triggers compaction (the compaction thrash loop) and each
+ * cycle appends another full snapshot to the session file.
+ */
+export function resolveSummaryMaxTokens(config: Config, contextWindow: number | undefined): number {
+	if (config.summaryMaxTokens !== undefined && config.summaryMaxTokens > 0) {
+		return config.summaryMaxTokens;
+	}
+	if (typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0) {
+		return Math.max(1, Math.floor(contextWindow * SUMMARY_CONTEXT_RATIO));
+	}
+	return SUMMARY_FALLBACK_MAX_TOKENS;
+}
+
 const SETTINGS_KEY = "observational-memory";
 const PASSIVE_ENV = "PI_OBSERVATIONAL_MEMORY_PASSIVE";
 
@@ -141,6 +199,10 @@ function validTargetOrUndefined(value: unknown, maxTokens: number): number | und
 }
 
 function derivedObservationPoolTarget(maxTokens: number): number {
+	return Math.floor(maxTokens / 2);
+}
+
+function derivedReflectionPoolTarget(maxTokens: number): number {
 	return Math.floor(maxTokens / 2);
 }
 
@@ -179,15 +241,58 @@ function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	return model;
 }
 
+/** Identity used to dedupe chain entries and to compare against the session model. */
+export function configuredModelKey(model: ConfiguredModel): string {
+	return `${model.provider}/${model.id}`;
+}
+
+/**
+ * Normalize an ordered `models` array. Entries that are not usable model objects are
+ * dropped, and repeats of the same `provider/id` keep only their first position. The
+ * result is undefined when nothing usable is left, so an invalid array never hides a
+ * valid legacy `model`.
+ */
+function normalizeModels(value: unknown): ConfiguredModel[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const chain: ConfiguredModel[] = [];
+	const seen = new Set<string>();
+	for (const entry of value) {
+		const model = normalizeModel(entry);
+		if (!model) continue;
+		const key = configuredModelKey(model);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		chain.push(model);
+	}
+	return chain.length > 0 ? chain : undefined;
+}
+
+/**
+ * The ordered chain the memory workers try: `models` in order, then the legacy `model`
+ * when it is not already present. An empty chain means no override is configured, so
+ * the session model is the only candidate.
+ */
+export function modelChain(config: Config): ConfiguredModel[] {
+	const chain = config.models ? [...config.models] : [];
+	const legacy = config.model;
+	if (legacy && !chain.some((model) => configuredModelKey(model) === configuredModelKey(legacy))) {
+		chain.push(legacy);
+	}
+	return chain;
+}
+
 function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config> {
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
 		"observeAfterTokens",
 		"reflectAfterTokens",
 		"observerChunkMaxTokens",
+		"summaryMaxTokens",
 		"compactAfterTokens",
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
+		"reflectionsPoolMaxTokens",
+		"reflectionsPoolTargetTokens",
 		"agentMaxTurns",
 	] as const;
 	for (const key of numberKeys) {
@@ -202,6 +307,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;
+	const models = normalizeModels(value.models);
+	if (models) normalized.models = models;
 	const model = normalizeModel(value.model);
 	if (model) normalized.model = model;
 	return normalized;
@@ -236,17 +343,23 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 	const merged = {
 		...DEFAULTS,
 		observationsPoolTargetTokens: undefined,
+		reflectionsPoolTargetTokens: undefined,
 		...globalConfig,
 		...projectConfig,
 		...envConfig,
 	};
-	const target = validTargetOrUndefined(
+	const observationTarget = validTargetOrUndefined(
 		merged.observationsPoolTargetTokens,
 		merged.observationsPoolMaxTokens,
 	) ?? derivedObservationPoolTarget(merged.observationsPoolMaxTokens);
+	const reflectionTarget = validTargetOrUndefined(
+		merged.reflectionsPoolTargetTokens,
+		merged.reflectionsPoolMaxTokens,
+	) ?? derivedReflectionPoolTarget(merged.reflectionsPoolMaxTokens);
 
 	return {
 		...merged,
-		observationsPoolTargetTokens: target,
+		observationsPoolTargetTokens: observationTarget,
+		reflectionsPoolTargetTokens: reflectionTarget,
 	};
 }

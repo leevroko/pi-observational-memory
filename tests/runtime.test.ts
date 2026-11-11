@@ -19,7 +19,16 @@ describe("Runtime V3 behavior", () => {
 		const result = await runtime.resolveModel({ model: { provider: "openai" }, modelRegistry: registry, hasUI: false });
 
 		expect(registry.find).toHaveBeenCalledWith("anthropic", "configured");
-		expect(result).toEqual({ ok: true, model: configured, apiKey: "key", headers: { test: "yes" } });
+		expect(result).toEqual({
+			ok: true,
+			rejected: [],
+			candidates: [
+				// The configured model is the head of the chain, and the session model
+				// follows it as the tail candidate a stage falls back to.
+				{ model: configured, label: "anthropic/configured", source: "configured", thinking: undefined, apiKey: "key", headers: { test: "yes" }, env: undefined, baseUrl: undefined },
+				{ model: { provider: "openai" }, label: "openai", source: "session", thinking: undefined, apiKey: "key", headers: { test: "yes" }, env: undefined, baseUrl: undefined },
+			],
+		});
 	});
 
 	it("falls back to session model and notifies when configured model is missing", async () => {
@@ -31,9 +40,9 @@ describe("Runtime V3 behavior", () => {
 
 		const result = await runtime.resolveModel({ model: sessionModel, modelRegistry: registry, hasUI: true, ui: { notify } });
 
-		expect(result).toMatchObject({ ok: true, model: sessionModel });
+		expect(result).toMatchObject({ ok: true, candidates: [{ model: sessionModel, source: "session" }] });
 		expect(notify).toHaveBeenCalledWith(
-			"Observational memory: configured model anthropic/missing not found, using session model",
+			"Observational memory: anthropic/missing skipped (not found in model registry), using openai",
 			"warning",
 		);
 	});
@@ -61,11 +70,9 @@ describe("Runtime V3 behavior", () => {
 
 		const result = await runtime.resolveModel({ model, modelRegistry: registry, hasUI: false });
 
-		expect(result).toEqual({
+		expect(result).toMatchObject({
 			ok: true,
-			model,
-			apiKey: undefined,
-			headers: { Authorization: "Bearer oauth-token" },
+			candidates: [{ model, apiKey: undefined, headers: { Authorization: "Bearer oauth-token" } }],
 		});
 	});
 
@@ -76,7 +83,7 @@ describe("Runtime V3 behavior", () => {
 
 		const result = await runtime.resolveModel({ model, modelRegistry: registry, hasUI: false });
 
-		expect(result).toEqual({ ok: true, model, apiKey: "sk-ant-key", headers: undefined });
+		expect(result).toMatchObject({ ok: true, candidates: [{ model, apiKey: "sk-ant-key", headers: undefined }] });
 	});
 
 	it("rejects auth that carries neither apiKey nor usable headers", async () => {
@@ -160,6 +167,107 @@ describe("Runtime V3 behavior", () => {
 		expect(runtime.consolidationPhase).toBeUndefined();
 	});
 
+
+	describe("memory model chain", () => {
+		function registryWith(found: Record<string, unknown>, auth: Record<string, unknown> = {}) {
+			return {
+				find: vi.fn((provider: string, id: string) => found[`${provider}/${id}`]),
+				getApiKeyAndHeaders: vi.fn(async (model: { provider?: string; id?: string }) => {
+					const key = `${model?.provider}/${model?.id}`;
+					return auth[key] ?? { ok: true, apiKey: `key-${key}` };
+				}),
+			};
+		}
+
+		it("keeps the configured order and skips entries the registry does not know", async () => {
+			const runtime = new Runtime();
+			const first = { provider: "a", id: "one" };
+			const second = { provider: "b", id: "two" };
+			runtime.config = {
+				...runtime.config,
+				models: [
+					{ provider: "a", id: "one", thinking: "high" },
+					{ provider: "ghost", id: "gone" },
+					{ provider: "b", id: "two" },
+				],
+			};
+
+			const result = await runtime.resolveModel({
+				model: undefined,
+				modelRegistry: registryWith({ "a/one": first, "b/two": second }),
+				hasUI: false,
+			});
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.candidates.map((candidate) => candidate.label)).toEqual(["a/one", "b/two"]);
+			expect(result.candidates.map((candidate) => candidate.apiKey)).toEqual(["key-a/one", "key-b/two"]);
+			expect(result.candidates[0]!.thinking).toBe("high");
+			expect(result.rejected).toEqual([{ label: "ghost/gone", reason: "not found in model registry" }]);
+		});
+
+		it("skips a known model whose credential does not resolve", async () => {
+			const runtime = new Runtime();
+			runtime.config = { ...runtime.config, models: [{ provider: "a", id: "one" }, { provider: "b", id: "two" }] };
+
+			const result = await runtime.resolveModel({
+				model: undefined,
+				modelRegistry: registryWith(
+					{ "a/one": { provider: "a", id: "one" }, "b/two": { provider: "b", id: "two" } },
+					{ "a/one": { ok: false, error: "no key" } },
+				),
+				hasUI: false,
+			});
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.candidates.map((candidate) => candidate.label)).toEqual(["b/two"]);
+			expect(result.rejected).toEqual([{ label: "a/one", reason: 'no API key or auth headers for provider "a"' }]);
+		});
+
+		it("reports every rejection when nothing in the chain is usable", async () => {
+			const runtime = new Runtime();
+			runtime.config = { ...runtime.config, models: [{ provider: "a", id: "one" }, { provider: "b", id: "two" }] };
+
+			const result = await runtime.resolveModel({
+				model: undefined,
+				modelRegistry: registryWith({ "a/one": { provider: "a", id: "one" } }, { "a/one": { ok: false } }),
+				hasUI: false,
+			});
+
+			expect(result).toEqual({
+				ok: false,
+				reason: 'no usable memory model: a/one (no API key or auth headers for provider "a"); b/two (not found in model registry)',
+			});
+		});
+
+		it("does not append the session model twice when the chain already names it", async () => {
+			const runtime = new Runtime();
+			const sessionModel = { provider: "a", id: "one" };
+			runtime.config = { ...runtime.config, model: { provider: "a", id: "one", thinking: "medium" } };
+
+			const result = await runtime.resolveModel({ model: sessionModel, modelRegistry: registryWith({ "a/one": sessionModel }), hasUI: false });
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.candidates).toHaveLength(1);
+			expect(result.candidates[0]).toMatchObject({ source: "configured", thinking: "medium" });
+		});
+
+		it("keeps the configured thinking level when falling back to the session model", async () => {
+			const runtime = new Runtime();
+			runtime.config = { ...runtime.config, model: { provider: "ghost", id: "gone", thinking: "high" } };
+			const sessionModel = { provider: "openai", id: "gpt" };
+
+			const result = await runtime.resolveModel({ model: sessionModel, modelRegistry: registryWith({}), hasUI: false });
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.candidates).toHaveLength(1);
+			expect(result.candidates[0]).toMatchObject({ model: sessionModel, source: "session", thinking: "high" });
+		});
+	});
+
 	it("forwards env and baseUrl from model registry", async () => {
 		const runtime = new Runtime();
 		const model = { provider: "cloudflare-workers-ai", id: "@cf/mistralai/mistral-small-3.1-24b-instruct" };
@@ -175,13 +283,15 @@ describe("Runtime V3 behavior", () => {
 
 		const result = await runtime.resolveModel({ model, modelRegistry: registry, hasUI: false });
 
-		expect(result).toEqual({
+		expect(result).toMatchObject({
 			ok: true,
-			model,
-			apiKey: "test-key",
-			headers: { Authorization: "Bearer test" },
-			env: { CLOUDFLARE_ACCOUNT_ID: "abc123" },
-			baseUrl: "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+			candidates: [{
+				model,
+				apiKey: "test-key",
+				headers: { Authorization: "Bearer test" },
+				env: { CLOUDFLARE_ACCOUNT_ID: "abc123" },
+				baseUrl: "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+			}],
 		});
 	});
 });

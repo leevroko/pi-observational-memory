@@ -1,5 +1,5 @@
-import { observationLineTokenCount } from "../../tokens.js";
-import type { Observation } from "../../session-ledger/index.js";
+import { observationLineTokenCount, reflectionLineTokenCount } from "../../tokens.js";
+import type { Observation, Reflection } from "../../session-ledger/index.js";
 
 export type ObservationPoolMetrics = {
 	observationTokens: number;
@@ -30,8 +30,8 @@ export function droppableObservationCount(observations: readonly Observation[]):
 	return observations.length;
 }
 
-export function maxDropCountForPool(observations: readonly Observation[], observationTokens: number, targetTokens: number): number {
-	const activeObservationCount = observations.length;
+export function maxDropCountForPool<T>(items: readonly T[], observationTokens: number, targetTokens: number): number {
+	const activeObservationCount = items.length;
 	if (activeObservationCount === 0) return 0;
 	if (!Number.isFinite(observationTokens) || observationTokens <= 0) return 0;
 	if (!Number.isFinite(targetTokens) || targetTokens < 0) return 0;
@@ -67,5 +67,51 @@ export function observationPoolMetrics(
 		maxDropsAllowed,
 		overTarget,
 		ready: overTarget && maxDropsAllowed > 0,
+	};
+}
+
+export type ReflectionPoolMetrics = {
+	reflectionTokens: number;
+	maxTokens: number;
+	targetTokens: number;
+	tokensOverTarget: number;
+	fullness: number;
+	activeReflectionCount: number;
+	maxDropsAllowed: number;
+	overMax: boolean;
+	ready: boolean;
+};
+
+export function reflectionTokenSum(reflections: readonly Reflection[]): number {
+	// Count the rendered line (id + content), the same basis the summary uses.
+	return reflections.reduce((sum, reflection) => sum + reflectionLineTokenCount(reflection), 0);
+}
+
+/**
+ * Reflection pool state. Unlike observations (which trim toward the target as
+ * soon as they are over it), reflections are durable distillates: the dropper
+ * only fires once the pool crosses the HARD max, and then trims toward the
+ * target in one thorough pass. This keeps reflection churn rare.
+ */
+export function reflectionPoolMetrics(
+	reflections: readonly Reflection[],
+	maxTokens: number,
+	targetTokens: number,
+): ReflectionPoolMetrics {
+	const reflectionTokens = reflectionTokenSum(reflections);
+	const activeReflectionCount = reflections.length;
+	const tokensOverTarget = Math.max(0, reflectionTokens - targetTokens);
+	const maxDropsAllowed = maxDropCountForPool(reflections, reflectionTokens, targetTokens);
+	const overMax = Number.isFinite(maxTokens) && maxTokens > 0 && reflectionTokens > maxTokens;
+	return {
+		reflectionTokens,
+		maxTokens,
+		targetTokens,
+		tokensOverTarget,
+		fullness: observationPoolFullness(reflectionTokens, targetTokens),
+		activeReflectionCount,
+		maxDropsAllowed,
+		overMax,
+		ready: overMax && maxDropsAllowed > 0,
 	};
 }

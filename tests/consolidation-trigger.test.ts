@@ -39,6 +39,28 @@ beforeEach(() => {
 	mockAgents.runDropper.mockResolvedValue(undefined);
 });
 
+/**
+ * Build what `resolveModel` returns for an ordered memory-model chain. Each argument
+ * is a candidate override; `label` names it, the rest mirrors ResolvedModelCandidate.
+ */
+function modelChainResult(...entries: Array<Record<string, any>>) {
+	return {
+		ok: true as const,
+		rejected: [],
+		candidates: entries.map((entry, index) => {
+			const { label, ...rest } = entry;
+			return {
+				source: "configured" as const,
+				label: label ?? `memory-${index + 1}`,
+				model: { reasoning: true },
+				apiKey: "key",
+				headers: { h: "v" },
+				...rest,
+			};
+		}),
+	};
+}
+
 function setup(args: {
 	entries: TestEntry[];
 	observeAfterTokens?: number;
@@ -86,7 +108,8 @@ function setup(args: {
 		lastReflectorError: undefined as string | undefined,
 		lastDropperError: undefined as string | undefined,
 		ensureConfig: vi.fn(),
-		resolveModel: vi.fn(async () => ({ ok: true, model: { reasoning: true }, apiKey: "key", headers: { h: "v" } })),
+		resolveModel: vi.fn(async () => modelChainResult({ thinking: "minimal" })),
+		lastStageModels: {} as Record<string, string>,
 		launchConsolidationTask: vi.fn((_ctx, work) => {
 			runtime.consolidationInFlight = true;
 			launchedWork = work;
@@ -233,12 +256,12 @@ describe("V3 consolidation trigger", () => {
 		mockAgents.runObserver.mockResolvedValueOnce([obs]);
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
 		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, reflectAfterTokens: 999 });
-		runtime.resolveModel.mockResolvedValueOnce({
-			ok: true,
+		runtime.resolveModel.mockResolvedValue(modelChainResult({
+			label: "kimi-coding/kimi-for-coding",
 			model: { provider: "kimi-coding" },
 			apiKey: undefined,
 			headers: { Authorization: "Bearer oauth-token" },
-		});
+		}));
 
 		fire();
 		await runLaunchedWork();
@@ -422,6 +445,115 @@ describe("V3 consolidation trigger", () => {
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 	});
 
+
+	it("retries the observer on the next model in the chain after a stream error", async () => {
+		const obs = observation("cccccccccccc", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
+		mockAgents.runObserver
+			.mockRejectedValueOnce(new ObserverStreamError("error", "rate limit reached"))
+			.mockResolvedValueOnce([obs]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, pi, runtime, ctx } = setup({ entries, reflectAfterTokens: 999 });
+		runtime.resolveModel.mockResolvedValue(modelChainResult({ label: "team-vllm/qwen" }, { label: "zai/glm" }));
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).toHaveBeenCalledTimes(2);
+		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_OBSERVATIONS_RECORDED, { observations: [obs], coversUpToId: "raw-1" });
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			'Observational memory: observer retried on zai/glm after team-vllm/qwen failed: observer stream ended with stopReason "error": rate limit reached',
+			"warning",
+		);
+		expect(runtime.lastStageModels.observer).toBe("zai/glm");
+		expect(runtime.observerEmptyBackoff).toBeUndefined();
+	});
+
+	it("reports the last failure once every model in the chain has been tried", async () => {
+		mockAgents.runObserver.mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:8000"));
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, pi, runtime, ctx } = setup({ entries, reflectAfterTokens: 999 });
+		runtime.resolveModel.mockResolvedValue(modelChainResult({ label: "a/one" }, { label: "b/two" }));
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).toHaveBeenCalledTimes(2);
+		expect(pi.appendEntry).not.toHaveBeenCalled();
+		expect(runtime.lastObserverError).toContain("ECONNREFUSED");
+		expect(runtime.lastStageModels.observer).toBeUndefined();
+		// A spent chain stops the pipeline; the run is a failure, not a clean empty.
+		expect(mockAgents.runReflector).not.toHaveBeenCalled();
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			"Observational memory: observer retried on b/two after a/one failed: connect ECONNREFUSED 127.0.0.1:8000",
+			"warning",
+		);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			"Observational memory: observer failed: connect ECONNREFUSED 127.0.0.1:8000",
+			"warning",
+		);
+	});
+
+	it("rebuilds the observer chunk for the fallback model's context window", async () => {
+		const obs = observation("555555555555", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
+		mockAgents.runObserver
+			.mockRejectedValueOnce(new Error("prompt is too long"))
+			.mockResolvedValueOnce([obs]);
+		const entries = [
+			textCustomMessage("raw-1", "a".repeat(800)),
+			textCustomMessage("raw-2", "b".repeat(800)),
+		];
+		const { fire, runLaunchedWork, runtime } = setup({ entries, reflectAfterTokens: 999 });
+		// A 1,280-token window caps the chunk at 256 tokens (only raw-1 fits); the
+		// fallback's 256,000-token window takes both entries instead of failing again.
+		runtime.resolveModel.mockResolvedValue(modelChainResult(
+			{ label: "small/ctx", model: { reasoning: true, contextWindow: 1_280 } },
+			{ label: "big/ctx", model: { reasoning: true, contextWindow: 256_000 } },
+		));
+
+		fire();
+		await runLaunchedWork();
+
+		const calls = mockAgents.runObserver.mock.calls.map((call) => call[0]);
+		expect(calls[0].allowedSourceEntryIds).toEqual(["raw-1"]);
+		expect(calls[1].allowedSourceEntryIds).toEqual(["raw-1", "raw-2"]);
+		expect(calls[1].chunk.length).toBeGreaterThan(calls[0].chunk.length);
+	});
+
+	it("passes each candidate its own thinking level", async () => {
+		const obs = observation("666666666666", { sourceEntryIds: ["raw-1"], tokenCount: 4 });
+		mockAgents.runObserver
+			.mockRejectedValueOnce(new Error("nope"))
+			.mockResolvedValueOnce([obs]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, runtime } = setup({ entries, reflectAfterTokens: 999 });
+		runtime.resolveModel.mockResolvedValue(modelChainResult({ label: "a/one", thinking: "high" }, { label: "b/two", thinking: "off" }));
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runObserver).toHaveBeenNthCalledWith(1, expect.objectContaining({ thinkingLevel: "high" }));
+		expect(mockAgents.runObserver).toHaveBeenNthCalledWith(2, expect.objectContaining({ thinkingLevel: "off" }));
+	});
+
+	it("retries the reflector on the next model in the chain", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runReflector.mockRejectedValueOnce(new Error("502 upstream")).mockResolvedValueOnce([newRef]);
+		const entries = [
+			textCustomMessage("raw-1", "aaaaaaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obsA], coversUpToId: "raw-1" }),
+		];
+		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, observeAfterTokens: 999 });
+		runtime.resolveModel.mockResolvedValue(modelChainResult({ label: "a/one" }, { label: "b/two" }));
+
+		fire();
+		await runLaunchedWork();
+
+		expect(mockAgents.runReflector).toHaveBeenCalledTimes(2);
+		expect(mockAgents.runObserver).not.toHaveBeenCalled();
+		expect(pi.appendEntry).toHaveBeenCalledWith(OM_REFLECTIONS_RECORDED, { reflections: [newRef], coversUpToId: "raw-1" });
+		expect(runtime.lastStageModels.reflector).toBe("b/two");
+	});
 
 	it("model resolution failure skips appending and notifies once", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
@@ -752,7 +884,7 @@ describe("observer chunk cap", () => {
 		];
 		const { fire, runLaunchedWork, pi, runtime } = setup({ entries, reflectAfterTokens: 999 });
 		// contextWindow 1,280 -> cap = floor(1,280 * 0.2) = 256, so only raw-1 fits.
-		runtime.resolveModel.mockResolvedValue({ ok: true, model: { reasoning: true, contextWindow: 1_280 }, apiKey: "key", headers: { h: "v" } } as any);
+		runtime.resolveModel.mockResolvedValue(modelChainResult({ model: { reasoning: true, contextWindow: 1_280 } }) as any);
 
 		fire();
 		await runLaunchedWork();

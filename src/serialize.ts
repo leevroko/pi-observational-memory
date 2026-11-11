@@ -173,17 +173,36 @@ export type SourceAddressedSerializationOptions = {
 const SOURCE_OMISSION_MARKER =
 	"\n\n[… middle omitted: source exceeds observer input budget; original source remains in the session ledger …]\n\n";
 
+function buildSourceExcerpt(label: string, rendered: string, headChars: number, tailChars: number): string {
+	return `${label}\n${rendered.slice(0, headChars)}${SOURCE_OMISSION_MARKER}${tailChars > 0 ? rendered.slice(-tailChars) : ""}`;
+}
+
 function truncateSourceBlockToTokenBudget(label: string, rendered: string, maxTokens: number): string | undefined {
-	const required = `${label}\n${SOURCE_OMISSION_MARKER}`;
-	if (estimateStringTokens(required) > maxTokens) return undefined;
+	const fixed = `${label}\n${SOURCE_OMISSION_MARKER}`;
+	if (estimateStringTokens(fixed) > maxTokens) return undefined;
 	const full = `${label}\n${rendered}`;
 	if (estimateStringTokens(full) <= maxTokens) return full;
-	const maxChars = Math.max(1, maxTokens * 4);
-	const fixed = `${label}\n${SOURCE_OMISSION_MARKER}`;
-	const retainedChars = maxChars - fixed.length;
-	const headChars = Math.ceil(retainedChars / 2);
-	const tailChars = retainedChars - headChars;
-	return `${label}\n${rendered.slice(0, headChars)}${SOURCE_OMISSION_MARKER}${tailChars > 0 ? rendered.slice(-tailChars) : ""}`;
+	// Retained-char budget is found by binary search over the real estimate:
+	// plain char arithmetic (maxTokens * 4) cannot express the budget because
+	// the ASCII/non-ASCII mix changes with every head/tail slice.
+	let best = 0;
+	let lo = 0;
+	let hi = rendered.length;
+	while (lo <= hi) {
+		const mid = lo + Math.floor((hi - lo) / 2);
+		const headChars = Math.ceil(mid / 2);
+		const tailChars = mid - headChars;
+		if (estimateStringTokens(buildSourceExcerpt(label, rendered, headChars, tailChars)) <= maxTokens) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	if (best <= 0) return undefined;
+	const headChars = Math.ceil(best / 2);
+	const tailChars = best - headChars;
+	return buildSourceExcerpt(label, rendered, headChars, tailChars);
 }
 
 function isSourceRenderableEntry(entry: RenderableEntry): boolean {

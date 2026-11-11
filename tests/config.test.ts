@@ -9,7 +9,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 	getAgentDir: () => mock.agentDir,
 }));
 
-import { DEFAULTS, loadConfig, readEnvConfig, resolveCompactAfterTokens } from "../src/config.js";
+import { DEFAULTS, loadConfig, modelChain, readEnvConfig, resolveCompactAfterTokens } from "../src/config.js";
 
 function writeJson(path: string, value: unknown) {
 	mkdirSync(join(path, ".."), { recursive: true });
@@ -43,6 +43,8 @@ describe("V3 config", () => {
 			compactAfterTokensRatio: 0.68,
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
+			reflectionsPoolMaxTokens: 24000,
+			reflectionsPoolTargetTokens: 12000,
 			agentMaxTurns: 16,
 			showWorkerNotifications: true,
 			passive: false,
@@ -98,6 +100,79 @@ describe("V3 config", () => {
 		expect(loadConfig(cwd, {})).toMatchObject({
 			model: { provider: "anthropic", id: "claude", thinking: "max" },
 		});
+	});
+
+	it("reads an ordered models chain", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				models: [
+					{ provider: "team-vllm", id: "qwen3.8-flash", thinking: "low" },
+					{ provider: "zai", id: "glm-5.3-flash" },
+				],
+			},
+		});
+
+		const config = loadConfig(cwd, {});
+		expect(config.models).toEqual([
+			{ provider: "team-vllm", id: "qwen3.8-flash", thinking: "low" },
+			{ provider: "zai", id: "glm-5.3-flash" },
+		]);
+		expect(modelChain(config)).toEqual(config.models);
+	});
+
+	it("treats the legacy model as a single-entry chain", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": { model: { provider: "zai", id: "glm-5.3-flash", thinking: "low" } },
+		});
+
+		const config = loadConfig(cwd, {});
+		expect(config.models).toBeUndefined();
+		expect(modelChain(config)).toEqual([{ provider: "zai", id: "glm-5.3-flash", thinking: "low" }]);
+	});
+
+	it("appends a legacy model the chain does not already list", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				models: [{ provider: "team-vllm", id: "qwen" }],
+				model: { provider: "zai", id: "glm" },
+			},
+		});
+
+		expect(modelChain(loadConfig(cwd, {}))).toEqual([
+			{ provider: "team-vllm", id: "qwen" },
+			{ provider: "zai", id: "glm" },
+		]);
+	});
+
+	it("does not repeat a legacy model already present in the chain", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				models: [{ provider: "zai", id: "glm", thinking: "low" }],
+				model: { provider: "zai", id: "glm" },
+			},
+		});
+
+		expect(modelChain(loadConfig(cwd, {}))).toEqual([{ provider: "zai", id: "glm", thinking: "low" }]);
+	});
+
+	it("drops unusable and repeated models entries", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				models: [
+					{ provider: "team-vllm", id: "qwen" },
+					{ provider: "team-vllm", id: "qwen", thinking: "high" },
+					{ provider: "", id: "no-provider" },
+					"not-a-model",
+					{ id: "no-provider" },
+				],
+			},
+		});
+
+		expect(loadConfig(cwd, {}).models).toEqual([{ provider: "team-vllm", id: "qwen" }]);
+
+		// A chain of only unusable entries leaves no override at all, so the session model wins.
+		writeJson(join(cwd, ".pi", "settings.json"), { "observational-memory": { models: [{ id: "" }] } });
+		expect(loadConfig(cwd, {}).models).toBeUndefined();
 	});
 
 	it("ignores invalid V3 values", () => {

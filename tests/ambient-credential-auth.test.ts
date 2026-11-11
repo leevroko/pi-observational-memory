@@ -98,10 +98,11 @@ describe("resolveModel with request-time-signed providers", () => {
 
 		expect(result.ok).toBe(true);
 		if (result.ok) {
-			expect(result.model).toBe(bedrockModel);
+			expect(result.candidates).toHaveLength(1);
+			expect(result.candidates[0]!.model).toBe(bedrockModel);
 			// Nothing to forward: pi signs the request itself.
-			expect(result.apiKey).toBeUndefined();
-			expect(result.headers).toBeUndefined();
+			expect(result.candidates[0]!.apiKey).toBeUndefined();
+			expect(result.candidates[0]!.headers).toBeUndefined();
 		}
 	});
 

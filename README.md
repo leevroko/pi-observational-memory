@@ -215,11 +215,10 @@ A typical config:
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 16,
-    "model": {
-      "provider": "openrouter",
-      "id": "google/gemma-4-31b-it",
-      "thinking": "low"
-    },
+    "models": [
+      { "provider": "team-vllm", "id": "qwen3.8-flash", "thinking": "low" },
+      { "provider": "openrouter", "id": "google/gemma-4-31b-it", "thinking": "low" }
+    ],
     "showWorkerNotifications": true,
     "passive": false,
     "debugLog": false
@@ -269,6 +268,43 @@ the active model's `contextWindow` is unavailable (undefined, 0, or negative),
 so compaction still triggers safely. `/om:status` shows the resolved threshold
 on the `Next compaction` line regardless of mode.
 
+### Choosing memory models and their fallbacks
+
+`models` is an ordered chain of models the observer, reflector, and dropper may use.
+The head is preferred, and every later entry is a fallback that runs only when the
+earlier one could not do the work:
+
+```json
+{
+  "observational-memory": {
+    "models": [
+      { "provider": "team-vllm", "id": "qwen3.8-flash", "thinking": "low" },
+      { "provider": "zai", "id": "glm-5.3-flash", "thinking": "low" },
+      { "provider": "openrouter", "id": "google/gemma-4-31b-it" }
+    ]
+  }
+}
+```
+
+An entry is skipped, and the next one tried, when Pi's model registry does not know
+it, when the provider has no usable credential, or when the call itself fails
+(connection refused, rate limit, 4xx/5xx, stream error, rejected request). The same
+work is then retried on the next entry, and each stage starts again from the head of
+the chain.
+
+The session model is always tried last, whether or not `models` is set, so background
+memory keeps working when every configured provider is offline. Each entry may carry
+its own `thinking` level; stages use `low` when an entry omits it.
+
+Because the observer sizes one chunk from the context window of the model that is
+about to run, a fallback with a smaller window gets a smaller chunk instead of a
+request the provider would reject.
+
+The legacy single-model form still works: `model` is read as `models: [model]`, and
+when both keys are present the `models` entries come first with `model` appended last.
+
+`/om:status` prints the resolved chain and the model each stage used in the last run.
+
 ### Defaults
 
 | Setting                     | Default       | Meaning                                                                                           |
@@ -282,12 +318,13 @@ on the `Next compaction` line regardless of mode.
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
 | `agentMaxTurns`             | `16`          | Shared turn cap for background memory-agent loops.                                                |
-| `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
+| `models`                    | session model | Ordered chain of memory-worker models: `{ provider, id, thinking }` each, tried in order, session model last. |
+| `model`                     | unset         | Legacy single-model form, read as `models: [model]`.                                              |
 | `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, and dropper progress notifications. Warnings and errors are unaffected. |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
 | `debugLog`                  | `false`       | Writes opt-in per-session extension debug events to Pi's agent directory.                         |
 
-Valid `model.thinking` values are:
+Valid `models[].thinking` values are:
 
 * `off`
 * `minimal`
@@ -297,7 +334,7 @@ Valid `model.thinking` values are:
 * `xhigh`
 * `max`
 
-If no `model` is configured, memory workers use the session model.
+If no `models` or `model` is configured, memory workers use the session model. When a chain is configured, see [Choosing memory models and their fallbacks](#choosing-memory-models-and-their-fallbacks).
 
 Set `showWorkerNotifications` to `false` to hide routine worker start and completion messages (including deliberate-empty observer info messages). Model fallback/unavailability, worker failures (including observer stream errors), compaction notifications, and explicit `/om:*` command output remain visible.
 
@@ -390,7 +427,7 @@ What this means in practice:
 | `observationThresholdTokens` | `observeAfterTokens`                                    | Rename. Same rough role: observation cadence based on raw/source tokens.                                                                       |
 | `compactionThresholdTokens`  | `compactAfterTokens`                                    | Rename. Same rough role: proactive compaction cadence.                                                                                         |
 | `reflectionThresholdTokens`  | `reflectAfterTokens`, `observationsPoolMaxTokens`, and/or `observationsPoolTargetTokens` | Split. Use `reflectAfterTokens` for reflection scheduling, `observationsPoolMaxTokens` for compaction full-fold pressure, and `observationsPoolTargetTokens` for dropper active observation maintenance. |
-| `compactionModel`            | `model`                                                 | Move `{ provider, id }` to `model`.                                                                                                            |
+| `compactionModel`            | `models` (or legacy `model`)                            | Move `{ provider, id }` into a one-entry `models` chain, or to `model`.                                                                        |
 | `thinkingLevel`              | `model.thinking`                                        | Move under `model`.                                                                                                                            |
 | `observerMaxTurnsPerRun`     | `agentMaxTurns`                                         | Replace with the shared memory-agent turn cap.                                                                                                 |
 | `reflectorMaxTurnsPerPass`   | `agentMaxTurns`                                         | Replace with the shared memory-agent turn cap.                                                                                                 |
@@ -428,11 +465,9 @@ V3 equivalent:
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 12,
-    "model": {
-      "provider": "openrouter",
-      "id": "google/gemma-4-31b-it",
-      "thinking": "low"
-    },
+    "models": [
+      { "provider": "openrouter", "id": "google/gemma-4-31b-it", "thinking": "low" }
+    ],
     "passive": false
   }
 }

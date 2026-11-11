@@ -1,8 +1,38 @@
-import { type Config, DEFAULTS, loadConfig } from "./config.js";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { type Config, configuredModelKey, DEFAULTS, loadConfig, modelChain } from "./config.js";
 import { debugLog } from "./debug-log.js";
 
+/** Request auth pi hands to a model call, resolved once per candidate. */
+export interface ModelAuth {
+	apiKey?: string;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+	baseUrl?: string;
+}
+
+/** One memory model that resolved AND authenticated, ready to be attempted. */
+export interface ResolvedModelCandidate {
+	/** Model object from pi's registry, or the session model. */
+	model: unknown;
+	/** "provider/id" for a configured entry, session-derived label otherwise. */
+	label: string;
+	source: "configured" | "session";
+	/** Thinking level configured for this chain entry; stages fall back to "low". */
+	thinking?: ModelThinkingLevel;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+	baseUrl?: string;
+}
+
+/** A chain entry that was skipped, with the reason it was unusable. */
+export interface RejectedModel {
+	label: string;
+	reason: string;
+}
+
 export type ResolveResult =
-	| { ok: true; model: unknown; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string>; baseUrl?: string }
+	| { ok: true; candidates: ResolvedModelCandidate[]; rejected: RejectedModel[] }
 	| { ok: false; reason: string };
 
 /**
@@ -50,7 +80,7 @@ const AVAILABILITY_RECHECK_REARM_MS = 60_000;
 
 type NotifyLevel = "warning" | "info" | "error";
 type Notify = (message: string, type?: NotifyLevel) => void;
-export type ConsolidationPhase = "observer" | "reflector" | "dropper";
+export type ConsolidationPhase = "observer" | "reflector" | "dropper" | "reflection-dropper";
 
 /**
  * Whether pi positively reports a working credential source for this model's provider.
@@ -96,6 +126,51 @@ export interface LaunchCtx {
 	ui?: { notify: Notify };
 }
 
+/** Display identity of a model object ("provider/id"), or `fallback` when unknown. */
+export function modelLabel(model: unknown, fallback: string): string {
+	const entry = model as { provider?: unknown; id?: unknown } | undefined;
+	const provider = typeof entry?.provider === "string" ? entry.provider : undefined;
+	const id = typeof entry?.id === "string" ? entry.id : undefined;
+	if (provider && id) return `${provider}/${id}`;
+	if (provider) return provider;
+	return fallback;
+}
+
+/**
+ * Whether two model objects describe the same model. Compares by reference first,
+ * then by label, so a configured chain entry that names the session model does not
+ * get attempted twice.
+ */
+function sameModel(a: unknown, b: unknown): boolean {
+	if (a === b) return true;
+	const labelA = modelLabel(a, "");
+	return labelA !== "" && labelA === modelLabel(b, "");
+}
+
+/**
+ * Ordered walk through the resolved memory-model chain. A stage starts at the head
+ * and calls {@link advance} after a failed attempt; the chain is spent once
+ * {@link current} returns undefined.
+ */
+export class ModelCursor {
+	private index = 0;
+
+	constructor(
+		readonly candidates: readonly ResolvedModelCandidate[],
+		readonly rejected: readonly RejectedModel[] = [],
+	) {}
+
+	get current(): ResolvedModelCandidate | undefined {
+		return this.candidates[this.index];
+	}
+
+	/** Move past the candidate that just failed. Returns the next one, or undefined. */
+	advance(): ResolvedModelCandidate | undefined {
+		this.index += 1;
+		return this.current;
+	}
+}
+
 export class Runtime {
 	config: Config = { ...DEFAULTS };
 	configLoaded = false;
@@ -107,9 +182,14 @@ export class Runtime {
 	compactInFlight = false;
 	compactHookInFlight = false;
 	resolveFailureNotified = false;
+	/** Notified once per session when the compaction summary had to be truncated to fit the context budget. */
+	summaryBudgetNotified = false;
 	lastObserverError: string | undefined;
 	lastReflectorError: string | undefined;
 	lastDropperError: string | undefined;
+	lastReflectionDropperError: string | undefined;
+	/** Model each stage of the last consolidation run actually used, by stage label. */
+	lastStageModels: Partial<Record<ConsolidationPhase, string>> = {};
 	/** provider -> epoch ms of the last availability re-check (see `recheckProviderCredential`). */
 	availabilityRecheckedAt = new Map<string, number>();
 	/** Deliberate-empty backoff (#23): skip observer re-fires over the same span until enough new tokens arrive. */
@@ -125,20 +205,76 @@ export class Runtime {
 		this.configLoaded = true;
 	}
 
+	/**
+	 * Resolve the memory-model chain into usable candidates, in configured order.
+	 *
+	 * A configured entry pi's registry does not know, or one whose credential does
+	 * not resolve, is skipped and recorded in `rejected` rather than failing the run:
+	 * that is what keeps a chain usable while one provider is down. The session model
+	 * is always tried last. Historically a `model` override that could not be found
+	 * meant "use the session model", and keeping the session model as the tail is also
+	 * the safety net when the whole configured chain is unavailable.
+	 */
 	async resolveModel(ctx: ResolveCtx): Promise<ResolveResult> {
-		let model = ctx.model;
-		if (this.config.model) {
-			const configured = ctx.modelRegistry.find(this.config.model.provider, this.config.model.id);
-			if (configured) {
-				model = configured;
-			} else if (ctx.hasUI && ctx.ui) {
-				ctx.ui.notify(
-					`Observational memory: configured model ${this.config.model.provider}/${this.config.model.id} not found, using session model`,
-					"warning",
-				);
+		const candidates: ResolvedModelCandidate[] = [];
+		const rejected: RejectedModel[] = [];
+		const chain = modelChain(this.config);
+
+		for (const configured of chain) {
+			const label = configuredModelKey(configured);
+			const found = ctx.modelRegistry.find(configured.provider, configured.id);
+			if (!found) {
+				rejected.push({ label, reason: "not found in model registry" });
+				continue;
+			}
+			const resolved = await this.checkCredential(ctx, found);
+			if (!resolved.ok) {
+				rejected.push({ label, reason: resolved.reason });
+				continue;
+			}
+			candidates.push({ model: found, label, source: "configured", thinking: configured.thinking, ...resolved.auth });
+		}
+
+		const sessionModel = ctx.model;
+		const sessionTried = sessionModel !== undefined
+			&& candidates.some((candidate) => sameModel(candidate.model, sessionModel));
+		if (sessionModel !== undefined && !sessionTried) {
+			const label = modelLabel(sessionModel, "session model");
+			const resolved = await this.checkCredential(ctx, sessionModel);
+			if (resolved.ok) {
+				// Reaching the session model through the chain keeps the configured
+				// thinking level, the way a single `model` override always did.
+				candidates.push({ model: sessionModel, label, source: "session", thinking: chain[0]?.thinking, ...resolved.auth });
+			} else {
+				rejected.push({ label, reason: resolved.reason });
 			}
 		}
-		if (!model) return { ok: false, reason: "no model available (session has no model and no observational-memory model configured)" };
+
+		if (candidates.length === 0) {
+			if (rejected.length === 0) {
+				return { ok: false, reason: "no model available (session has no model and no observational-memory model configured)" };
+			}
+			if (rejected.length === 1) return { ok: false, reason: rejected[0]!.reason };
+			const summary = rejected.map((entry) => `${entry.label} (${entry.reason})`).join("; ");
+			return { ok: false, reason: `no usable memory model: ${summary}` };
+		}
+
+		if (rejected.length > 0) {
+			for (const entry of rejected) debugLog("resolve.rejected_candidate", { model: entry.label, reason: entry.reason });
+			if (ctx.hasUI && ctx.ui) {
+				const skipped = rejected.map((entry) => `${entry.label} skipped (${entry.reason})`).join(", ");
+				ctx.ui.notify(`Observational memory: ${skipped}, using ${candidates[0]!.label}`, "warning");
+			}
+		}
+
+		return { ok: true, candidates, rejected };
+	}
+
+	/**
+	 * Whether pi can authenticate requests for one resolved model object, and the
+	 * auth payload to use when it can.
+	 */
+	private async checkCredential(ctx: ResolveCtx, model: unknown): Promise<{ ok: true; auth: ModelAuth } | { ok: false; reason: string }> {
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		const provider = (model as { provider?: string }).provider ?? "unknown";
 		const isOAuth = ctx.modelRegistry.isUsingOAuth?.(model) === true;
@@ -164,36 +300,19 @@ export class Runtime {
 		const usable = hasUsableAuth(auth);
 		const resolvedEmptyApiKey = typeof auth.apiKey === "string" && auth.apiKey.length === 0;
 		let providerCredentialConfigured = hasConfiguredProviderCredential(ctx.modelRegistry, model);
-		// pi's gate has TWO halves and never trusts the snapshot alone (agent-session.js):
-		//
-		//   hasConfiguredAuth(provider) || (await checkAuth(provider)) !== undefined
-		//
-		// `hasConfiguredAuth` reads `snapshot.configuredProviders`, which is populated by an
-		// availability pass — and left untouched when that pass is skipped
-		// (`refreshOnCreate: false`), aborted, or FAILS (its catch records `availabilityError`
-		// and returns). A provider whose credential could not be checked at startup — an
-		// expired SSO token, say — is therefore absent from the snapshot for the rest of the
-		// session, even after the user renews it out of band. pi recovers on the next turn
-		// because its second half re-checks live; reading only the snapshot half would leave
-		// consolidation dead for the whole session, which is the same silent-failure class as
-		// the bug this gate was fixed for.
-		//
-		// The facade exposes no `checkAuth`, but `refresh({ providers })` performs the same
-		// live check and then updates the snapshot, so re-reading afterwards is equivalent.
-		// Only attempted when everything else already looks like the ambient shape, so an
-		// ordinary unauthenticated provider still fails on the first call.
+		// pi's gate has TWO halves and never trusts the availability snapshot alone
+		// (`AgentSession._getRequiredRequestAuth` in pi): a provider missing from a
+		// stale or failed snapshot is re-checked live before the run gives up. See
+		// `recheckProviderCredential`.
 		if (auth.ok === true && !usable && !isOAuth && !resolvedEmptyApiKey && !providerCredentialConfigured) {
 			providerCredentialConfigured = await this.recheckProviderCredential(ctx.modelRegistry, model, provider);
 		}
-		const signsAtRequestTime =
-			auth.ok === true && !isOAuth && !resolvedEmptyApiKey && providerCredentialConfigured;
+		const signsAtRequestTime = auth.ok === true && !isOAuth && !resolvedEmptyApiKey && providerCredentialConfigured;
 		if (!auth.ok || (!usable && !signsAtRequestTime)) {
 			const reason = isOAuth
 				? `authentication failed for provider "${provider}" — OAuth credentials may have expired; run '/login ${provider}' to re-authenticate`
 				: `no API key or auth headers for provider "${provider}"`;
-			// The reason string alone cannot tell `ok: false` from `ok: true` with nothing to
-			// carry, which is what made the ambient-credential outage un-diagnosable from the
-			// debug log. Record the decision inputs — booleans and counts only, never values.
+			// Record the decision inputs — booleans and counts only, never values.
 			debugLog("resolve.rejected", {
 				provider,
 				reason,
@@ -213,11 +332,12 @@ export class Runtime {
 		}
 		return {
 			ok: true,
-			model,
-			apiKey: auth.apiKey as string | undefined,
-			headers: auth.headers as Record<string, string> | undefined,
-			env: auth.env as Record<string, string> | undefined,
-			baseUrl: auth.baseUrl as string | undefined,
+			auth: {
+				apiKey: auth.apiKey as string | undefined,
+				headers: auth.headers as Record<string, string> | undefined,
+				env: auth.env as Record<string, string> | undefined,
+				baseUrl: auth.baseUrl as string | undefined,
+			},
 		};
 	}
 
@@ -296,6 +416,7 @@ export class Runtime {
 		this.lastObserverError = undefined;
 		this.lastReflectorError = undefined;
 		this.lastDropperError = undefined;
+		this.lastStageModels = {};
 		const promise = this.launchTrackedTask(ctx, "consolidation", work, () => {
 			this.consolidationInFlight = false;
 			this.consolidationPhase = undefined;

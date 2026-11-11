@@ -1,8 +1,10 @@
+import { reflectionTokenSum } from "../agents/dropper/pool.js";
 import {
 	OM_FOLDED,
 	isMemoryDetails,
 	isObservationsDroppedEntry,
 	isObservationsRecordedEntry,
+	isReflectionsDroppedEntry,
 	isReflectionsRecordedEntry,
 	type Entry,
 	type MemoryDetails,
@@ -23,6 +25,13 @@ export type ProjectionDiff = {
 
 export type CompactionProjectionConfig = {
 	observationsPoolMaxTokens: number;
+	/**
+	 * Hard ceiling for the rendered reflection pool. Crossing it forces a full
+	 * fold at compaction time so reflection drops become visible in summaries.
+	 * Optional so existing callers keep the old behavior; omitting it disables
+	 * the reflection side of the full-fold trigger.
+	 */
+	reflectionsPoolMaxTokens?: number;
 };
 
 export type CompactionProjection = Projection & {
@@ -39,6 +48,7 @@ type ProjectionFoldOptions = {
 	observationsBoundary: ProjectionBoundary;
 	reflectionsBoundary: ProjectionBoundary;
 	dropsBoundary: ProjectionBoundary;
+	reflectionDropsBoundary: ProjectionBoundary;
 };
 
 function entryIndexById(entries: Entry[]): Map<string, number> {
@@ -86,11 +96,13 @@ function foldProjection(entries: Entry[], options: ProjectionFoldOptions): Proje
 	const observationsBoundary = boundaryIndex(entries, indexes, options.observationsBoundary);
 	const reflectionsBoundary = boundaryIndex(entries, indexes, options.reflectionsBoundary);
 	const dropsBoundary = boundaryIndex(entries, indexes, options.dropsBoundary);
+	const reflectionDropsBoundary = boundaryIndex(entries, indexes, options.reflectionDropsBoundary);
 	const observations: Observation[] = [];
 	const reflections: Reflection[] = [];
 	const observationsById = new Set<string>();
 	const reflectionsById = new Set<string>();
 	const droppedObservationIds = new Set<string>();
+	const droppedReflectionIds = new Set<string>();
 
 	for (const entry of entries) {
 		if (isObservationsRecordedEntry(entry) && isCoveredAtOrBefore(entry, indexes, observationsBoundary)) {
@@ -113,12 +125,17 @@ function foldProjection(entries: Entry[], options: ProjectionFoldOptions): Proje
 
 		if (isObservationsDroppedEntry(entry) && isCoveredAtOrBefore(entry, indexes, dropsBoundary)) {
 			for (const observationId of entry.data.observationIds) droppedObservationIds.add(observationId);
+			continue;
+		}
+
+		if (isReflectionsDroppedEntry(entry) && isCoveredAtOrBefore(entry, indexes, reflectionDropsBoundary)) {
+			for (const reflectionId of entry.data.reflectionIds) droppedReflectionIds.add(reflectionId);
 		}
 	}
 
 	return {
 		observations: observations.filter((observation) => !droppedObservationIds.has(observation.id)),
-		reflections,
+		reflections: reflections.filter((reflection) => !droppedReflectionIds.has(reflection.id)),
 	};
 }
 
@@ -144,6 +161,7 @@ export function fullProjection(entries: Entry[], upToEntryId?: string): Projecti
 		observationsBoundary: boundary,
 		reflectionsBoundary: boundary,
 		dropsBoundary: boundary,
+		reflectionDropsBoundary: boundary,
 	});
 }
 
@@ -153,7 +171,10 @@ export function visibleProjection(entries: Entry[], upToEntryId?: string): Proje
 		return details ? projectionFromMemoryDetails(details) : { observations: [], reflections: [] };
 	}
 
-	return buildCompactionProjection(entries, upToEntryId, { observationsPoolMaxTokens: Number.POSITIVE_INFINITY });
+	return buildCompactionProjection(entries, upToEntryId, {
+		observationsPoolMaxTokens: Number.POSITIVE_INFINITY,
+		reflectionsPoolMaxTokens: Number.POSITIVE_INFINITY,
+	});
 }
 
 export function latestFullFoldBoundaryId(entries: Entry[]): string | undefined {
@@ -181,12 +202,16 @@ export function buildCompactionProjection(
 		observationsBoundary: entryBoundary(firstKeptEntryId),
 		reflectionsBoundary: maintenanceBoundary,
 		dropsBoundary: maintenanceBoundary,
+		reflectionDropsBoundary: maintenanceBoundary,
 	});
 	const observationTokens = normalProjection.observations.reduce(
 		(total, observation) => total + observation.tokenCount,
 		0,
 	);
-	const fullFold = observationTokens >= config.observationsPoolMaxTokens;
+	const reflectionTokens = reflectionTokenSum(normalProjection.reflections);
+	const reflectionsPoolMaxTokens = config.reflectionsPoolMaxTokens ?? Number.POSITIVE_INFINITY;
+	const fullFold = observationTokens >= config.observationsPoolMaxTokens
+		|| reflectionTokens >= reflectionsPoolMaxTokens;
 	const projection = fullFold
 		? fullProjection(entries, firstKeptEntryId)
 		: normalProjection;

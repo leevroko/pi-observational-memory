@@ -41,6 +41,7 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 		lastObserverError: undefined,
 		lastReflectorError: undefined,
 		lastDropperError: undefined,
+		lastStageModels: {} as Record<string, string>,
 		...args.runtime,
 	};
 	registerStatusCommand(pi as any, runtime as any);
@@ -66,13 +67,45 @@ describe("V3 /om:status", () => {
 
 		expect(output).toContain("── Memory ──");
 		expect(output).toContain("Observations: 0 recorded / 0 dropped / 0 active / 0 visible");
-		expect(output).toContain("Reflections:  0 recorded / 0 visible");
+		expect(output).toContain("Reflections:  0 recorded / 0 dropped / 0 active / 0 visible");
 		expect(output).toContain("Next observation:");
 		expect(output).toContain("Next compaction:");
 		expect(output).not.toContain("Visible:");
 		expect(output).not.toContain("Drift:");
 		expect(output).not.toContain("committed");
 		expect(output).not.toContain("pending");
+	});
+
+	it("shows the memory model chain and the model the last run used", async () => {
+		const output = await setup({
+			entries: [],
+			runtime: {
+				config: {
+					observeAfterTokens: 10,
+					reflectAfterTokens: 20,
+					compactAfterTokens: 30,
+					observationsPoolMaxTokens: 40,
+					observationsPoolTargetTokens: 20,
+					passive: false,
+					models: [
+						{ provider: "team-vllm", id: "qwen3.8-flash", thinking: "low" },
+						{ provider: "zai", id: "glm-5.3-flash" },
+					],
+				},
+				lastStageModels: { observer: "zai/glm-5.3-flash" },
+			},
+			model: { provider: "openai", id: "gpt", contextWindow: 200_000 },
+		}).run();
+
+		expect(output).toContain("Chain: team-vllm/qwen3.8-flash (low), zai/glm-5.3-flash, openai/gpt (session)");
+		expect(output).toContain("Last run observer: zai/glm-5.3-flash");
+		expect(output).not.toContain("Last run reflector");
+	});
+
+	it("names the session model as the whole chain when nothing is configured", async () => {
+		const output = await setup({ entries: [], model: { provider: "openai", id: "gpt" } }).run();
+
+		expect(output).toContain("Chain: openai/gpt (session)");
 	});
 
 	it("reports V3 ledger counts, visible/full drift, and ignores old V2 memory", async () => {
@@ -92,7 +125,7 @@ describe("V3 /om:status", () => {
 		const output = await setup({ entries }).run();
 
 		expect(output).toContain("Observations: 2 recorded / 1 dropped / 1 active / 1 visible +1 -1");
-		expect(output).toContain("Reflections:  1 recorded / 0 visible +1");
+		expect(output).toContain("Reflections:  1 recorded / 0 dropped / 1 active / 0 visible +1");
 		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
 		// Active pool counts the full rendered line (id + timestamp + relevance + content).
 		expect(output).toContain("Active observation pool: ~19 / 20 target tokens (95%)");
@@ -125,7 +158,8 @@ describe("V3 /om:status", () => {
 		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");
 		// Active pool counts the full rendered line, unlike the visible pool's stored tokenCount.
 		expect(output).toContain("Active observation pool: ~19 / 20 target tokens (95%)");
-		expect(output).toContain("Reflection pool:         ~3 tokens");
+		expect(output).toMatch(/Reflection pool: +~[\d,]+ \/ 24,000 max tokens \(\d+%\)/);
+		expect(output).toContain("Reflection trim target:  ~12,000 tokens");
 		expect(output).not.toContain("Observation pool:");
 		expect(output).not.toContain("Full fold pool:");
 		expect(output).not.toContain("visible observation tokens");

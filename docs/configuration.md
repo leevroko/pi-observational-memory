@@ -36,11 +36,9 @@ The extension loads config once for its runtime. After changing settings, restar
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 16,
-    "model": {
-      "provider": "openrouter",
-      "id": "google/gemma-4-31b-it",
-      "thinking": "low"
-    },
+    "models": [
+      { "provider": "openrouter", "id": "google/gemma-4-31b-it", "thinking": "low" }
+    ],
     "showWorkerNotifications": true,
     "passive": false,
     "debugLog": false
@@ -48,7 +46,7 @@ The extension loads config once for its runtime. After changing settings, restar
 }
 ```
 
-You can omit everything. Defaults work for ordinary sessions, and if `model` is unset the memory workers use the current session model.
+You can omit everything. Defaults work for ordinary sessions, and if neither `models` nor `model` is set the memory workers use the current session model.
 
 ## Settings reference
 
@@ -60,11 +58,15 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `compactAfterTokens` | positive integer | `81000` | Estimated source-entry threshold for proactive auto-compaction, counted after the latest compaction boundary. |
 | `observationsPoolMaxTokens` | positive integer | `20000` | Normal compaction-projection observation-token pressure that makes compaction do a full fold. |
 | `observationsPoolTargetTokens` | positive integer below max | half of `observationsPoolMaxTokens` | Folded active observation target used by post-reflection dropper maintenance. |
+| `reflectionsPoolMaxTokens` | positive integer | `24000` | Hard ceiling for the active reflection pool; crossing it arms the reflection dropper and forces a full fold at compaction time. |
+| `reflectionsPoolTargetTokens` | positive integer below max | half of `reflectionsPoolMaxTokens` | Trim target the reflection dropper moves toward once the hard ceiling is crossed. |
+| `summaryMaxTokens` | positive integer | `floor(contextWindow * 0.15)`, or `24000` when unknown | Hard cap on the rendered compaction summary. Overflow drops oldest observations first, then oldest reflections, with a recallable-ids marker. |
 | `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, and dropper. |
-| `model` | object | unset | Optional model override for observer, reflector, and dropper. |
-| `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
-| `model.id` | string | unset | Model id in Pi's model registry. Required when `model` is set. |
-| `model.thinking` | enum | unset; workers fall back to `low` | Optional reasoning/thinking level for memory workers. |
+| `models` | array of objects | unset | Ordered chain of memory-worker models. Entries are tried in order, and the session model is tried last. |
+| `models[].provider` | string | unset | Provider name in Pi's model registry. Required for each entry. |
+| `models[].id` | string | unset | Model id in Pi's model registry. Required for each entry. |
+| `models[].thinking` | enum | unset; workers fall back to `low` | Reasoning/thinking level used when this entry runs. |
+| `model` | object | unset | Legacy single-model form, equivalent to `models: [model]`. |
 | `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
@@ -139,25 +141,56 @@ This is the shared nested-agent turn cap for the observer, reflector, and droppe
 
 Use lower values to bound background memory-worker cost. Too low can reduce observation coverage or reflection/drop quality.
 
-## `model`
+## `models`
 
 Default: unset, meaning memory workers use the session model.
 
-Set `model` when you want the observer, reflector, and dropper to use a cheaper or faster model than the main coding agent:
+Set `models` when you want the memory workers on a cheaper or faster model than the main coding agent, and you want that choice to survive the model going away. The list is an ordered chain: the head is preferred, and each later entry is a fallback that runs only when the earlier one could not do the work.
 
 ```json
 {
   "observational-memory": {
-    "model": {
-      "provider": "openrouter",
-      "id": "google/gemma-4-31b-it",
-      "thinking": "low"
-    }
+    "models": [
+      { "provider": "team-vllm", "id": "qwen3.8-flash", "thinking": "low" },
+      { "provider": "zai", "id": "glm-5.3-flash", "thinking": "low" },
+      { "provider": "openrouter", "id": "google/gemma-4-31b-it" }
+    ]
   }
 }
 ```
 
-`provider` and `id` must both be non-empty strings. `thinking` is optional. If the configured model cannot be resolved, the runtime attempts to fall back to the current session model and notifies once. Memory workers accept either an API key or OAuth-style auth headers (e.g. `Authorization: Bearer …`), so OAuth-authenticated providers work without an API key. If no usable model or credentials are available, the relevant background worker skips/fails safely rather than inventing memory.
+An entry is skipped, and the next one tried, when:
+
+1. Pi's model registry has no such `provider`/`id` (a typo, or a provider this machine does not have).
+2. The provider has no usable credential: no API key, no auth header, and no request-time signing source.
+3. The call itself fails: connection refused, a 4xx/5xx or rate-limit response, a stream error, or a request the provider rejects. The same work is then attempted on the next entry, and each stage walks the chain from the head.
+
+The current session model is always tried last, whether or not `models` is set. That preserves the historical behaviour of a `model` override that could not be found ("use the session model") and leaves one working candidate when every configured provider is down. An entry that names the session model is not attempted twice.
+
+`provider` and `id` must both be non-empty strings, and `thinking` is optional per entry, so a cheaper fallback can also reason less; stages use `low` when an entry omits it. Unusable entries and repeats of the same `provider`/`id` are dropped when the config is read. Memory workers accept either an API key or OAuth-style auth headers (e.g. `Authorization: Bearer …`), so OAuth-authenticated providers work without an API key. If no candidate is usable, the relevant background worker skips or fails safely rather than inventing memory.
+
+The observer budgets one chunk from the context window of the model that is about to run (see `observerChunkMaxTokens`, default 20% of it), so a fallback model with a smaller window gets a smaller chunk instead of a request the provider would reject.
+
+Skips are reported as they happen:
+
+```
+Observational memory: team-vllm/qwen3.8-flash skipped (not found in model registry), using zai/glm-5.3-flash
+Observational memory: observer retried on zai/glm-5.3-flash after team-vllm/qwen3.8-flash failed: connect ECONNREFUSED 127.0.0.1:8000
+```
+
+`/om:status` shows the resolved chain and which model each stage used in the last run. With `debugLog` on, look for `resolve.rejected_candidate`, `resolve.rejected`, and `<stage>.model_attempt_failed`.
+
+### `model` (legacy)
+
+`model` is still read. A config that sets only `model` behaves exactly like `models: [model]`. When both keys are present, the `models` entries come first and `model` is appended as the last configured entry, unless the chain already lists it.
+
+```json
+{
+  "observational-memory": {
+    "model": { "provider": "openrouter", "id": "google/gemma-4-31b-it", "thinking": "low" }
+  }
+}
+```
 
 ## `showWorkerNotifications`
 
@@ -222,7 +255,7 @@ V3 is not backwards compatible with V2 settings. Old keys are silently ignored a
 | `observationThresholdTokens` | `observeAfterTokens` | Rename. Same rough observer-cadence role. |
 | `compactionThresholdTokens` | `compactAfterTokens` | Rename. Same rough proactive-compaction role. |
 | `reflectionThresholdTokens` | `reflectAfterTokens`, `observationsPoolMaxTokens`, and/or `observationsPoolTargetTokens` | Split. Use `reflectAfterTokens` for reflector cadence, `observationsPoolMaxTokens` for compaction full-fold pressure, and `observationsPoolTargetTokens` for dropper active observation maintenance. |
-| `compactionModel` | `model` | Move `{ provider, id }` under `model`. |
+| `compactionModel` | `model` or `models` | Move `{ provider, id }` under `model`, or into a one-entry `models` chain. |
 | `thinkingLevel` | `model.thinking` | Move under `model`. |
 | `observerMaxTurnsPerRun` | `agentMaxTurns` | Replace with one shared cap. |
 | `reflectorMaxTurnsPerPass` | `agentMaxTurns` | Replace with one shared cap. |
@@ -243,12 +276,15 @@ Old V2 memory entries and old V2 compaction details are ignored by V3. Start a n
     "observeAfterTokens": 20000,
     "reflectAfterTokens": 50000,
     "agentMaxTurns": 8,
-    "model": { "provider": "openrouter", "id": "a-cheaper-model", "thinking": "off" }
+    "models": [
+      { "provider": "team-vllm", "id": "a-local-model", "thinking": "off" },
+      { "provider": "openrouter", "id": "a-cheaper-model", "thinking": "off" }
+    ]
   }
 }
 ```
 
-Tradeoff: fewer background model calls, but memory updates lag longer, observation chunks are larger, and reflection/drop cleanup happens less often.
+Tradeoff: fewer background model calls, but memory updates lag longer, observation chunks are larger, and reflection/drop cleanup happens less often. The local model keeps background memory free of API cost while the hosted entry catches the runs made while it is offline.
 
 ### More responsive memory
 

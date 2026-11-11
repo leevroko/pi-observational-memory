@@ -1,18 +1,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
-import { observationPoolMetrics } from "../agents/dropper/pool.js";
-import { ObserverStreamError, runObserver } from "../agents/observer/agent.js";
+import { observationPoolMetrics, reflectionPoolMetrics } from "../agents/dropper/pool.js";
+import { runReflectionDropper } from "../agents/reflection-dropper/agent.js";
+import { runObserver } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { resolveObserverChunkMaxTokens } from "../config.js";
-import type { ResolveResult, Runtime } from "../runtime.js";
+import { ModelCursor, type ResolveResult, type ResolvedModelCandidate, type Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
+	OM_REFLECTIONS_DROPPED,
 	OM_REFLECTIONS_RECORDED,
 	buildObservationsDroppedData,
 	buildObservationsRecordedData,
+	buildReflectionsDroppedData,
 	buildReflectionsRecordedData,
 	earlierCoverageMarkerId,
 	foldLedger,
@@ -26,12 +29,11 @@ import {
 	rawTokensSinceReflectionCoverage,
 	reflectionToSummaryLine,
 	type Entry,
-	type Observation,
 	type Reflection,
 	type V3MemoryCustomType,
 } from "../session-ledger/index.js";
 
-type ResolvedModel = Extract<ResolveResult, { ok: true }>;
+type StageName = "observer" | "reflector" | "dropper" | "reflection-dropper";
 
 type ConsolidationCtx = {
 	cwd: string;
@@ -113,26 +115,74 @@ function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
 	return runtime.config.showWorkerNotifications && ctx.hasUI;
 }
 
-function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: "observer" | "reflector" | "dropper") => Promise<ResolvedModel | undefined> {
-	let cached: ResolveResult | undefined;
+/**
+ * Resolve the memory-model chain once per consolidation run and hand each stage a
+ * cursor over it. Every stage starts at the head of the chain: the model that suits
+ * the observer's chunk is not necessarily the one that survives the dropper's call,
+ * and a stage that falls back must not inherit another stage's failures.
+ */
+function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: StageName) => Promise<ModelCursor | undefined> {
+	let cached: Promise<ResolveResult> | undefined;
 	return async (stage) => {
-		cached ??= await runtime.resolveModel({
+		cached ??= runtime.resolveModel({
 			model: ctx.model,
 			modelRegistry: ctx.modelRegistry,
 			hasUI: ctx.hasUI,
 			ui: ctx.ui,
 		});
-		if (cached.ok) {
+		const result = await cached;
+		if (result.ok) {
 			runtime.resolveFailureNotified = false;
-			return cached;
+			return new ModelCursor(result.candidates, result.rejected);
 		}
-		debugLog(`${stage}.model_unavailable`, { reason: cached.reason });
+		debugLog(`${stage}.model_unavailable`, { reason: result.reason });
 		if (!runtime.resolveFailureNotified && ctx.hasUI && ctx.ui) {
-			ctx.ui.notify(`Observational memory: ${stage} skipped — ${cached.reason}`, "warning");
+			ctx.ui.notify(`Observational memory: ${stage} skipped — ${result.reason}`, "warning");
 			runtime.resolveFailureNotified = true;
 		}
 		return undefined;
 	};
+}
+
+/**
+ * Run one stage attempt across the memory-model chain.
+ *
+ * Any error thrown by the attempt counts as that model being unavailable for this
+ * piece of work (connection refused, rate limit, stream failure, oversized request),
+ * so the same attempt is retried against the next candidate. When the chain is spent
+ * the last error comes back for the caller to record, and a session replacement
+ * mid-attempt stops the walk instead of burning the remaining candidates on a ctx
+ * that is about to go stale.
+ */
+async function withModelFallback<T>(
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	stage: StageName,
+	cursor: ModelCursor,
+	attempt: (candidate: ResolvedModelCandidate) => Promise<T>,
+): Promise<
+	| { ok: true; value: T; candidate: ResolvedModelCandidate }
+	| { ok: false; error: unknown; candidate: ResolvedModelCandidate | undefined }
+> {
+	for (;;) {
+		const candidate = cursor.current;
+		if (!candidate) {
+			return { ok: false, error: new Error(`${stage} has no usable memory model`), candidate: undefined };
+		}
+		try {
+			return { ok: true, value: await attempt(candidate), candidate };
+		} catch (error) {
+			if (runtime.consolidationCancelled) return { ok: false, error, candidate };
+			const next = cursor.advance();
+			const message = error instanceof Error ? error.message : String(error);
+			debugLog(`${stage}.model_attempt_failed`, { model: candidate.label, errorMessage: message, nextModel: next?.label });
+			if (!next) return { ok: false, error, candidate };
+			if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+				`Observational memory: ${stage} retried on ${next.label} after ${candidate.label} failed: ${message}`,
+				"warning",
+			);
+		}
+	}
 }
 
 export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime): void {
@@ -237,13 +287,98 @@ export async function runConsolidationPipeline(
 		if (cancelled()) return;
 		debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
 	}
+
+	runtime.consolidationPhase = "reflection-dropper";
+	try {
+		await runReflectionDropperStage(pi, runtime, ctx, resolveModel);
+		if (cancelled()) debugLog("consolidation.cancelled", { after: "reflection-dropper" });
+	} catch (error) {
+		if (cancelled()) return;
+		debugLog("reflection-dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflection-dropper", error) });
+	}
+}
+
+/**
+ * Trim the active reflection pool once it crosses the hard max. Reflections are
+ * durable distillates, so unlike observations this stage fires only over the
+ * hard ceiling (not the target) and trims toward the target in one pass.
+ */
+async function runReflectionDropperStage(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+	ctx: ConsolidationCtx,
+	resolveModel: (stage: StageName) => Promise<ModelCursor | undefined>,
+): Promise<StageOutcome> {
+	const entries = ctx.sessionManager.getBranch() as Entry[];
+	const folded = foldLedger(entries);
+	const metrics = reflectionPoolMetrics(
+		folded.activeReflections,
+		runtime.config.reflectionsPoolMaxTokens,
+		runtime.config.reflectionsPoolTargetTokens,
+	);
+	if (!metrics.ready) {
+		debugLog("reflection-dropper.not_ready", {
+			reflectionTokens: metrics.reflectionTokens,
+			maxTokens: metrics.maxTokens,
+			targetTokens: metrics.targetTokens,
+			activeReflectionCount: metrics.activeReflectionCount,
+			maxDropsAllowed: metrics.maxDropsAllowed,
+		});
+		return "continue";
+	}
+	debugLog("reflection-dropper.stage_start", {
+		reflectionTokens: metrics.reflectionTokens,
+		maxTokens: metrics.maxTokens,
+		targetTokens: metrics.targetTokens,
+		activeReflectionCount: metrics.activeReflectionCount,
+		maxDropsAllowed: metrics.maxDropsAllowed,
+	});
+
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+		`Observational memory: reflection pool ~${metrics.reflectionTokens.toLocaleString()} tokens over the ~${metrics.maxTokens.toLocaleString()} hard max; trimming toward ~${metrics.targetTokens.toLocaleString()}`,
+		"info",
+	);
+	const cursor = await resolveModel("reflection-dropper");
+	if (!cursor) return "abort";
+	if (runtime.consolidationCancelled) return "abort";
+
+	const attempt = await withModelFallback(runtime, ctx, "reflection-dropper", cursor, (candidate) => runReflectionDropper({
+		model: candidate.model as any,
+		apiKey: candidate.apiKey,
+		headers: candidate.headers,
+		env: candidate.env,
+		reflections: folded.activeReflections,
+		maxTokens: runtime.config.reflectionsPoolMaxTokens,
+		targetTokens: runtime.config.reflectionsPoolTargetTokens,
+		maxTurns: runtime.config.agentMaxTurns,
+		thinkingLevel: candidate.thinking ?? "low",
+	}));
+	if (!attempt.ok) throw attempt.error;
+	runtime.lastStageModels["reflection-dropper"] = attempt.candidate.label;
+	const droppedIds = attempt.value;
+	if (runtime.consolidationCancelled) return "abort";
+	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
+	const reflectionCoverageId = latestCoverageMarkerId(entries, OM_REFLECTIONS_RECORDED);
+	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, reflectionCoverageId);
+	const data = coversUpToId && droppedIds ? buildReflectionsDroppedData(droppedIds, coversUpToId) : undefined;
+	debugLog("reflection-dropper.append", {
+		droppedIdsCount: droppedIds?.length ?? 0,
+		coversUpToId,
+		dataBuilt: data !== undefined,
+	});
+	if (data) appendEntry(pi, OM_REFLECTIONS_DROPPED, data);
+	if (data && shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+		`Observational memory: ${data.reflectionIds.length} reflection${data.reflectionIds.length === 1 ? "" : "s"} dropped from active memory`,
+		"info",
+	);
+	return "continue";
 }
 
 async function runObserverStage(
 	pi: ExtensionAPI,
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
-	resolveModel: (stage: "observer") => Promise<ResolvedModel | undefined>,
+	resolveModel: (stage: StageName) => Promise<ModelCursor | undefined>,
 ): Promise<StageOutcome> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
@@ -273,84 +408,88 @@ async function runObserverStage(
 		}
 	}
 
-	// Resolve the model before building the chunk: the default chunk cap
-	// derives from the resolved model's context window.
-	const resolved = await resolveModel("observer");
-	if (!resolved) return "abort";
+	const cursor = await resolveModel("observer");
+	if (!cursor) return "abort";
 	if (runtime.consolidationCancelled) return "abort"; // session replaced while resolving — drop out before touching captured ctx
 
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 	const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
-
-	// Budget the text that is actually sent to the observer, including source
-	// labels and rendered message content. Complete entries are kept intact.
-	// Only a first entry that cannot fit by itself is represented by a clearly
-	// marked head/tail excerpt; the original ledger entry remains untouched.
-	const contextWindow = (resolved.model as { contextWindow?: number }).contextWindow;
-	const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
-	const {
-		text: chunk,
-		sourceEntryIds,
-		estimatedTokens: chunkTokens,
-		truncatedSourceEntryIds,
-	} = serializeSourceAddressedBranchEntries(backlogEntries, { maxTokens: maxChunkTokens });
-	if (!chunk.trim() || sourceEntryIds.length === 0) return "continue";
-	const coversUpToId = sourceEntryIds.at(-1);
-	if (!coversUpToId) return "continue";
-
-	if (sourceEntryIds.length < backlogEntries.length || truncatedSourceEntryIds.length > 0) {
-		debugLog("observer.chunk_capped", {
-			maxChunkTokens,
-			backlogEntries: backlogEntries.length,
-			backlogTokens: tokens,
-			chunkEntries: sourceEntryIds.length,
-			chunkTokens,
-			truncatedSourceEntryIds,
-		});
-	}
-
 	const memory = fullProjection(entries);
 	const priorReflections = memory.reflections.map(reflectionToSummaryLine);
 	const priorObservations = memory.observations.map(observationToSummaryLine);
 
-	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
-		`Observational memory: observer running on ~${chunkTokens.toLocaleString()}-token chunk`,
-		"info",
-	);
-	debugLog("observer.start", {
-		tokens,
-		chunkTokens,
-		coversUpToId,
-		sourceEntryIds,
-		sourceEntryCount: sourceEntryIds.length,
-		priorReflections: priorReflections.length,
-		priorObservations: priorObservations.length,
-	});
+	// The chunk is budgeted inside the attempt: its default cap derives from the context
+	// window of the model that is about to be called, so a fallback model with a smaller
+	// window gets a smaller chunk instead of a request the provider would reject.
+	const outcome = await withModelFallback(runtime, ctx, "observer", cursor, async (candidate) => {
+		// Budget the text that is actually sent to the observer, including source labels
+		// and rendered message content. Complete entries are kept intact. Only a first
+		// entry that cannot fit by itself is represented by a clearly marked head/tail
+		// excerpt; the original ledger entry remains untouched.
+		const contextWindow = (candidate.model as { contextWindow?: number }).contextWindow;
+		const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
+		const {
+			text: chunk,
+			sourceEntryIds,
+			estimatedTokens: chunkTokens,
+			truncatedSourceEntryIds,
+		} = serializeSourceAddressedBranchEntries(backlogEntries, { maxTokens: maxChunkTokens });
+		if (!chunk.trim() || sourceEntryIds.length === 0) return { kind: "nothing-to-send" } as const;
+		const coversUpToId = sourceEntryIds.at(-1);
+		if (!coversUpToId) return { kind: "nothing-to-send" } as const;
 
-	let observations: Observation[] | undefined;
-	try {
-		observations = await runObserver({
-			model: resolved.model as any,
-			apiKey: resolved.apiKey,
-			headers: resolved.headers,
-			env: resolved.env,
+		if (sourceEntryIds.length < backlogEntries.length || truncatedSourceEntryIds.length > 0) {
+			debugLog("observer.chunk_capped", {
+				maxChunkTokens,
+				backlogEntries: backlogEntries.length,
+				backlogTokens: tokens,
+				chunkEntries: sourceEntryIds.length,
+				chunkTokens,
+				truncatedSourceEntryIds,
+			});
+		}
+
+		if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
+			`Observational memory: observer running on ~${chunkTokens.toLocaleString()}-token chunk`,
+			"info",
+		);
+		debugLog("observer.start", {
+			tokens,
+			chunkTokens,
+			coversUpToId,
+			sourceEntryIds,
+			sourceEntryCount: sourceEntryIds.length,
+			priorReflections: priorReflections.length,
+			priorObservations: priorObservations.length,
+		});
+
+		const observations = await runObserver({
+			model: candidate.model as any,
+			apiKey: candidate.apiKey,
+			headers: candidate.headers,
+			env: candidate.env,
 			priorReflections,
 			priorObservations,
 			chunk,
 			allowedSourceEntryIds: sourceEntryIds,
 			maxTurns: runtime.config.agentMaxTurns,
-			thinkingLevel: runtime.config.model?.thinking ?? "low",
+			thinkingLevel: candidate.thinking ?? "low",
 		});
-	} catch (error) {
-		if (error instanceof ObserverStreamError) {
-			// API/stream failure is not a clean empty (#32): surface it as a real
-			// failure instead of the "no observations" path. Coverage stays put.
-			runtime.recordConsolidationStageError(ctx, "observer", error);
-			return "abort";
-		}
-		throw error;
+		return { kind: "ran", observations, coversUpToId } as const;
+	});
+
+	if (!outcome.ok) {
+		// An API/stream failure is not a clean empty (#32): once every candidate has
+		// been tried it surfaces as a real failure and coverage stays where it was.
+		if (runtime.consolidationCancelled) return "abort";
+		runtime.recordConsolidationStageError(ctx, "observer", outcome.error);
+		return "abort";
 	}
+	runtime.lastStageModels.observer = outcome.candidate.label;
+	const attempt = outcome.value;
+	if (attempt.kind === "nothing-to-send") return "continue";
 	if (runtime.consolidationCancelled) return "abort"; // cancel before appending with a possibly-stale pi
+	const { observations, coversUpToId } = attempt;
 	if (!observations || observations.length === 0) {
 		// Deliberate empty: routine info, not a warning, and back off re-fires
 		// over the same span (#23).
@@ -384,7 +523,7 @@ async function runReflectorStage(
 	pi: ExtensionAPI,
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
-	resolveModel: (stage: "reflector") => Promise<ResolvedModel | undefined>,
+	resolveModel: (stage: StageName) => Promise<ModelCursor | undefined>,
 ): Promise<ReflectorStageResult> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const currentTokens = realContextTokens(ctx);
@@ -399,21 +538,24 @@ async function runReflectorStage(
 		`Observational memory: reflector running (~${reflectionTokens.toLocaleString()} tokens)`,
 		"info",
 	);
-	const resolved = await resolveModel("reflector");
-	if (!resolved) return { outcome: "abort", sameRunReflections: [] };
+	const cursor = await resolveModel("reflector");
+	if (!cursor) return { outcome: "abort", sameRunReflections: [] };
 	if (runtime.consolidationCancelled) return { outcome: "abort", sameRunReflections: [] };
 
 	const folded = foldLedger(entries);
-	const reflections = await runReflector({
-		model: resolved.model as any,
-		apiKey: resolved.apiKey,
-		headers: resolved.headers,
-		env: resolved.env,
+	const attempt = await withModelFallback(runtime, ctx, "reflector", cursor, (candidate) => runReflector({
+		model: candidate.model as any,
+		apiKey: candidate.apiKey,
+		headers: candidate.headers,
+		env: candidate.env,
 		reflections: folded.reflections,
 		observations: folded.activeObservations,
 		maxTurns: runtime.config.agentMaxTurns,
-		thinkingLevel: runtime.config.model?.thinking ?? "low",
-	});
+		thinkingLevel: candidate.thinking ?? "low",
+	}));
+	if (!attempt.ok) throw attempt.error;
+	runtime.lastStageModels.reflector = attempt.candidate.label;
+	const reflections = attempt.value;
 	if (!reflections) return { outcome: "continue", sameRunReflections: [] };
 	if (runtime.consolidationCancelled) return { outcome: "abort", sameRunReflections: [] }; // cancel before appending
 
@@ -431,7 +573,7 @@ async function runDropperStage(
 	pi: ExtensionAPI,
 	runtime: Runtime,
 	ctx: ConsolidationCtx,
-	resolveModel: (stage: "dropper") => Promise<ResolvedModel | undefined>,
+	resolveModel: (stage: StageName) => Promise<ModelCursor | undefined>,
 	sameRunReflections: Reflection[],
 	sameRunReflectionCoverageId: string | undefined,
 ): Promise<StageOutcome> {
@@ -474,22 +616,25 @@ async function runDropperStage(
 		`Observational memory: dropper running after reflection — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
 		"info",
 	);
-	const resolved = await resolveModel("dropper");
-	if (!resolved) return "abort";
+	const cursor = await resolveModel("dropper");
+	if (!cursor) return "abort";
 	if (runtime.consolidationCancelled) return "abort"; // session replaced while resolving
 
 	const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
-	const droppedIds = await runDropper({
-		model: resolved.model as any,
-		apiKey: resolved.apiKey,
-		headers: resolved.headers,
-		env: resolved.env,
+	const attempt = await withModelFallback(runtime, ctx, "dropper", cursor, (candidate) => runDropper({
+		model: candidate.model as any,
+		apiKey: candidate.apiKey,
+		headers: candidate.headers,
+		env: candidate.env,
 		reflections: reflectionsForDropper,
 		observations: folded.activeObservations,
 		targetTokens: runtime.config.observationsPoolTargetTokens,
 		maxTurns: runtime.config.agentMaxTurns,
-		thinkingLevel: runtime.config.model?.thinking ?? "low",
-	});
+		thinkingLevel: candidate.thinking ?? "low",
+	}));
+	if (!attempt.ok) throw attempt.error;
+	runtime.lastStageModels.dropper = attempt.candidate.label;
+	const droppedIds = attempt.value;
 	if (runtime.consolidationCancelled) return "abort"; // cancel before appending with a possibly-stale pi
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;
