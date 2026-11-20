@@ -164,6 +164,72 @@ describe("V3 compaction trigger", () => {
 		expect(ctx.compact).toHaveBeenCalledTimes(1);
 	});
 
+	it("ignores retained-tail tokens held before the latest compaction entry", async () => {
+		// Real-world ordering: the oversized retained tail sits BEFORE the compaction entry.
+		// Pi cannot summarize it ("Nothing to compact (session too small)"), so it must not
+		// count as compaction progress; only entries after the compaction do.
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const branch = [
+			textCustomMessage("kept", "aaaaaaaaaaaa"), // 3 tokens inside the retained tail
+			compactionEntry("cmp-1", { firstKeptEntryId: "kept" }),
+			textCustomMessage("new", "aaaa"), // 1 token of real growth
+		];
+		const ctx = fakeCtx([branch]);
+
+		handler(agentSettled(), ctx);
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactInFlight).toBe(false);
+	});
+
+	it("backs off after Pi refuses with nothing to compact, then re-arms on new growth", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch, dueBranch, dueBranch, dueBranch], {
+			compact: vi.fn((opts: { onError: (error: { message: string }) => void }) =>
+				opts.onError({ message: "Nothing to compact (session too small)" })),
+		});
+
+		handler(agentSettled(), ctx); // fires; Pi refuses
+		await vi.runAllTimersAsync();
+		expect(ctx.compact).toHaveBeenCalledTimes(1);
+		expect(runtime.compactRefusedBackoff).toEqual({ progressAtRefusal: 3, compactionId: undefined });
+
+		handler(agentSettled(), ctx); // same progress: backed off, no re-fire
+		await vi.runAllTimersAsync();
+		expect(ctx.compact).toHaveBeenCalledTimes(1);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			"Observational memory: Pi declined compaction (nothing new to summarize yet); backing off until more source tokens arrive",
+			"info",
+		);
+
+		const grownBranch = [...dueBranch, textCustomMessage("big", "a".repeat(80_004))]; // +20,001 tokens
+		const grownCtx = fakeCtx([grownBranch, grownBranch], { compact: vi.fn() });
+		handler(agentSettled(), grownCtx); // past the re-arm margin: fires again
+		await vi.runAllTimersAsync();
+		expect(grownCtx.compact).toHaveBeenCalledTimes(1);
+	});
+
+	it("clears the refusal backoff once a newer compaction ran", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const refusedCompact = vi.fn((opts: { onError: (error: { message: string }) => void }) =>
+			opts.onError({ message: "Nothing to compact (session too small)" }));
+		const branchA = [compactionEntry("cmp-1"), textCustomMessage("raw-1", "aaaaaaaaaaaa")];
+		const ctxA = fakeCtx([branchA, branchA], { compact: refusedCompact });
+
+		handler(agentSettled(), ctxA); // fires; refused under cmp-1
+		await vi.runAllTimersAsync();
+		expect(refusedCompact).toHaveBeenCalledTimes(1);
+		expect(runtime.compactRefusedBackoff).toEqual({ progressAtRefusal: 3, compactionId: "cmp-1" });
+
+		const branchB = [compactionEntry("cmp-2"), textCustomMessage("raw-1", "aaaaaaaaaaaa")];
+		const ctxB = fakeCtx([branchB, branchB], { compact: vi.fn() });
+		handler(agentSettled(), ctxB); // cmp-2 is newer: refusal is stale, fires again
+		await vi.runAllTimersAsync();
+		expect(ctxB.compact).toHaveBeenCalledTimes(1);
+		expect(runtime.compactRefusedBackoff).toBeUndefined();
+	});
+
 	it("does not compact when provider context and anchored growth exceed the threshold but raw progress does not", async () => {
 		const { handler, runtime } = captureHandler({ compactAfterTokens: 130000 });
 		const branch = [

@@ -227,3 +227,27 @@ export function rawTokensSinceLastCompaction(entries: Entry[]): number {
 	if (firstKeptIndex === -1) return rawTokensAfterIndex(entries, compactionIndex);
 	return rawTokensAfterIndex(entries, firstKeptIndex - 1);
 }
+
+/**
+ * Id of the latest compaction entry, for detecting that a new compaction ran.
+ */
+export function latestCompactionId(entries: Entry[]): string | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].type === "compaction") return entries[i].id;
+	}
+	return undefined;
+}
+
+/**
+ * Raw tokens of source entries created AFTER the latest compaction entry.
+ *
+ * Unlike rawTokensSinceLastCompaction this excludes the compaction's retained
+ * tail. Pi can only summarize entries that follow the latest compaction, so a
+ * retained tail entry (for example one oversized message that slipped whole
+ * into the keep-recent window) is not progress Pi can act on. Counting it made
+ * the trigger fire on every agent_settled while Pi kept refusing with
+ * "Nothing to compact (session too small)".
+ */
+export function rawNewTokensSinceLastCompaction(entries: Entry[]): number {
+	return rawTokensAfterIndex(entries, findLastCompactionIndex(entries));
+}

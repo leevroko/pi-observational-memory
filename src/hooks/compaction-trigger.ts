@@ -1,7 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolveCompactAfterTokens } from "../config.js";
-import { rawTokensSinceLastCompaction, type Entry } from "../session-ledger/index.js";
+import { latestCompactionId, rawNewTokensSinceLastCompaction, type Entry } from "../session-ledger/index.js";
 import type { Runtime } from "../runtime.js";
+
+/**
+ * After Pi refuses a compaction, require this much additional source material before
+ * trying again. Matches Pi's default compaction keepRecentTokens window: Pi cannot
+ * summarize anything until new growth outgrows what it keeps anyway.
+ */
+const COMPACT_REFUSAL_REARM_TOKENS = 20_000;
 
 export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): void {
 	// Pi emits agent_settled only after retries, automatic compaction, and queued
@@ -13,10 +20,22 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 
 		const entries = ctx.sessionManager?.getBranch?.() as Entry[] | undefined;
 		if (!entries) return;
-		const progress = rawTokensSinceLastCompaction(entries);
+		const progress = rawNewTokensSinceLastCompaction(entries);
 		const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
 		const threshold = resolveCompactAfterTokens(runtime.config, contextWindow);
 		if (progress < threshold) return;
+
+		if (runtime.compactRefusedBackoff) {
+			const refusal = runtime.compactRefusedBackoff;
+			// A newer compaction ran (e.g. Pi's own auto-compaction) — the refusal is stale.
+			if (refusal.compactionId !== latestCompactionId(entries)) {
+				runtime.compactRefusedBackoff = undefined;
+			} else if (progress < refusal.progressAtRefusal + COMPACT_REFUSAL_REARM_TOKENS) {
+				return;
+			} else {
+				runtime.compactRefusedBackoff = undefined;
+			}
+		}
 
 		// Capture ctx properties synchronously — the setTimeout + async work below
 		// may outlive the extension ctx (stale after session replacement/reload).
@@ -44,7 +63,7 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 					runtime.compactInFlight = false;
 					return;
 				}
-				const currentProgress = rawTokensSinceLastCompaction(currentEntries);
+				const currentProgress = rawNewTokensSinceLastCompaction(currentEntries);
 				if (currentProgress < threshold) {
 					runtime.compactInFlight = false;
 					if (hasUI) ui?.notify(
@@ -53,15 +72,26 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 					);
 					return;
 				}
+				const progressAtRefusal = currentProgress;
+				const compactionIdAtRefusal = latestCompactionId(currentEntries);
 				ctx.compact({
 					onComplete: () => {
 						runtime.compactInFlight = false;
+						runtime.compactRefusedBackoff = undefined;
 						if (hasUI) ui?.notify("Observational memory: compaction complete", "info");
 					},
 					onError: (error: { message: string }) => {
 						runtime.compactInFlight = false;
 						if (error.message === "Compaction cancelled") {
 							// We already notified the user with the real reason before returning { cancel: true }.
+							return;
+						}
+						if (error.message === "Nothing to compact (session too small)" || error.message === "Already compacted") {
+							runtime.compactRefusedBackoff = { progressAtRefusal, compactionId: compactionIdAtRefusal };
+							if (hasUI) ui?.notify(
+								"Observational memory: Pi declined compaction (nothing new to summarize yet); backing off until more source tokens arrive",
+								"info",
+							);
 							return;
 						}
 						if (hasUI) ui?.notify(`Observational memory: ${error.message}`, "error");

@@ -181,6 +181,9 @@ export class Runtime {
 	consolidationCancelled = false;
 	compactInFlight = false;
 	compactHookInFlight = false;
+	/** Backoff after Pi refuses a requested compaction ("Nothing to compact" / "Already compacted"):
+	 * skip re-fires until enough new source tokens arrive past the refusal, or a newer compaction runs. */
+	compactRefusedBackoff: { progressAtRefusal: number; compactionId: string | undefined } | undefined;
 	resolveFailureNotified = false;
 	/** Notified once per session when the compaction summary had to be truncated to fit the context budget. */
 	summaryBudgetNotified = false;
